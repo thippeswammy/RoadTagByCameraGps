@@ -37,6 +37,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.cos
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 class MainActivity : AppCompatActivity(), SensorEventListener {
 
@@ -68,6 +69,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var hasShownImuWarning: Boolean = false
     private var hasShownGpsWarning: Boolean = false
     private var firstGpsLocation: Location? = null
+    private var lastGpsLocation: Location? = null
+    private var lastGpsTimestamp: Long = 0
+    private var lastGpsLocalX: Double = 0.0
+    private var lastGpsLocalY: Double = 0.0
+    private var lastGpsLocalZ: Double = 0.0
+
+    // Sensor fusion variables
+    private var orientationQuaternion = floatArrayOf(1f, 0f, 0f, 0f) // [w, x, y, z]
+    private var lastImuTimestamp: Long = 0
+    private var position = doubleArrayOf(0.0, 0.0, 0.0) // [x, y, z]
+    private var velocity = doubleArrayOf(0.0, 0.0, 0.0) // [vx, vy, vz]
+    private var lastWorldAcc = floatArrayOf(0f, 0f, 0f) // World-frame acceleration
+    private val alpha = 0.98f // Complementary filter weight for gyroscope
+    private val gpsAlpha = 0.1 // Complementary filter weight for GPS position
 
     companion object {
         private const val CAMERA_REQUEST_CODE = 1
@@ -79,6 +94,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         private const val IMU_TIMEOUT_MS = 5000 // Warn after 5s
         private const val GPS_TIMEOUT_MS = 5000 // Warn after 5s
         private const val EARTH_RADIUS_M = 6371000.0 // Earth's radius in meters
+        private const val GRAVITY = 9.81f // m/s^2
     }
 
     private val locationCallback = object : LocationCallback() {
@@ -113,7 +129,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
         magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
 
-        // Check sensor availability
         if (accelerometer == null) {
             Log.e(TAG, "Accelerometer sensor not available")
             Toast.makeText(this, "Accelerometer not available", Toast.LENGTH_LONG).show()
@@ -142,41 +157,22 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val permissionsToRequest = mutableListOf<String>()
         val requestCodes = mutableListOf<Int>()
 
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.CAMERA
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             permissionsToRequest.add(Manifest.permission.CAMERA)
             requestCodes.add(CAMERA_REQUEST_CODE)
         }
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.RECORD_AUDIO
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             permissionsToRequest.add(Manifest.permission.RECORD_AUDIO)
             requestCodes.add(AUDIO_REQUEST_CODE)
         }
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ) != PackageManager.PERMISSION_GRANTED ||
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.ACCESS_COARSE_LOCATION
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             permissionsToRequest.add(Manifest.permission.ACCESS_FINE_LOCATION)
             permissionsToRequest.add(Manifest.permission.ACCESS_COARSE_LOCATION)
             requestCodes.add(LOCATION_REQUEST_CODE)
         }
         if (android.os.Build.VERSION.SDK_INT <= android.os.Build.VERSION_CODES.P &&
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.WRITE_EXTERNAL_STORAGE
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
             permissionsToRequest.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
             requestCodes.add(STORAGE_REQUEST_CODE)
         }
@@ -219,8 +215,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 }
                 startActivity(intent)
             } else {
-                Toast.makeText(this, "Please grant all required permissions.", Toast.LENGTH_LONG)
-                    .show()
+                Toast.makeText(this, "Please grant all required permissions.", Toast.LENGTH_LONG).show()
                 checkPermissions()
             }
         }
@@ -258,6 +253,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         startVideoRecording()
         startSensorRecording()
         startGpsRecording()
+        // Reset fusion state
+        orientationQuaternion = floatArrayOf(1f, 0f, 0f, 0f)
+        position = doubleArrayOf(0.0, 0.0, 0.0)
+        velocity = doubleArrayOf(0.0, 0.0, 0.0)
+        lastImuTimestamp = 0
     }
 
     private fun stopRecording() {
@@ -267,10 +267,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         stopSensorRecording()
         stopGpsRecording()
         closeFileWriters()
-        Log.d(
-            TAG,
-            "Sensor events: Acc=$accEventCount, Gyro=$gyroEventCount, Mag=$magEventCount, GPS=$gpsEventCount"
-        )
+        Log.d(TAG, "Sensor events: Acc=$accEventCount, Gyro=$gyroEventCount, Mag=$magEventCount, GPS=$gpsEventCount")
         Toast.makeText(
             this,
             "Files saved in Documents/App_names/Session_${timestampFormat.format(Date())}",
@@ -281,10 +278,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun createSessionFolder() {
         val timestamp = timestampFormat.format(Date())
         sessionFolder = File(
-            File(
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS),
-                "App_names"
-            ),
+            File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "App_names"),
             "Session_$timestamp"
         )
         try {
@@ -302,25 +296,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         Log.d(TAG, "Video file path: ${videoFile.absolutePath}")
         val outputOptions = androidx.camera.video.FileOutputOptions.Builder(videoFile).build()
 
-        videoCapture?.output?.prepareRecording(this, outputOptions)
-            ?.start(ContextCompat.getMainExecutor(this)) { event ->
-                when (event) {
-                    is VideoRecordEvent.Finalize -> {
-                        if (event.hasError()) {
-                            Log.e(TAG, "Video recording error: ${event.cause?.message}")
-                            Toast.makeText(
-                                this,
-                                "Video error: ${event.cause?.message}",
-                                Toast.LENGTH_SHORT
-                            ).show()
-                        } else {
-                            Log.d(TAG, "Video saved: ${videoFile.absolutePath}")
-                            Toast.makeText(this, "Video saved", Toast.LENGTH_SHORT).show()
-                        }
-                        activeRecording = null
+        videoCapture?.output?.prepareRecording(this, outputOptions)?.start(ContextCompat.getMainExecutor(this)) { event ->
+            when (event) {
+                is VideoRecordEvent.Finalize -> {
+                    if (event.hasError()) {
+                        Log.e(TAG, "Video recording error: ${event.cause?.message}")
+                        Toast.makeText(this, "Video error: ${event.cause?.message}", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Log.d(TAG, "Video saved: ${videoFile.absolutePath}")
+                        Toast.makeText(this, "Video saved", Toast.LENGTH_SHORT).show()
                     }
+                    activeRecording = null
                 }
-            }?.let { recording ->
+            }
+        }?.let { recording ->
             activeRecording = recording
         }
     }
@@ -335,7 +324,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             val imuFile = File(sessionFolder, "imu_data.csv")
             Log.d(TAG, "IMU file path: ${imuFile.absolutePath}")
             imuFileWriter = FileWriter(imuFile).apply {
-                write("timestamp,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,mag_x,mag_y,mag_z\n")
+                write("timestamp,position_x,position_y,position_z,acc_x,acc_y,acc_z,world_acc_x,world_acc_y,world_acc_z,gyro_x,gyro_y,gyro_z,mag_x,mag_y,mag_z\n")
                 flush()
             }
             sensorStartTime = System.currentTimeMillis()
@@ -344,11 +333,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             magEventCount = 0
             hasShownImuWarning = false
             if (accelerometer != null) {
-                sensorManager.registerListener(
-                    this,
-                    accelerometer,
-                    SensorManager.SENSOR_DELAY_FASTEST
-                )
+                sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_FASTEST)
                 Log.d(TAG, "Accelerometer listener registered")
             }
             if (gyroscope != null) {
@@ -356,11 +341,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 Log.d(TAG, "Gyroscope listener registered")
             }
             if (magnetometer != null) {
-                sensorManager.registerListener(
-                    this,
-                    magnetometer,
-                    SensorManager.SENSOR_DELAY_FASTEST
-                )
+                sensorManager.registerListener(this, magnetometer, SensorManager.SENSOR_DELAY_FASTEST)
                 Log.d(TAG, "Magnetometer listener registered")
             }
             Log.d(TAG, "Sensor recording started")
@@ -391,21 +372,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             gpsEventCount = 0
             hasShownGpsWarning = false
             firstGpsLocation = null
+            lastGpsLocation = null
+            lastGpsTimestamp = 0
             val locationRequest = LocationRequest.create().apply {
                 interval = 250 // 250ms for smoother paths
                 fastestInterval = 100
                 priority = LocationRequest.PRIORITY_HIGH_ACCURACY
             }
-            if (ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.ACCESS_FINE_LOCATION
-                ) == PackageManager.PERMISSION_GRANTED
-            ) {
-                fusedLocationClient.requestLocationUpdates(
-                    locationRequest,
-                    locationCallback,
-                    Looper.getMainLooper()
-                )
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                fusedLocationClient.requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper())
                 Log.d(TAG, "GPS recording started")
             }
         } catch (e: Exception) {
@@ -440,64 +415,167 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     Sensor.TYPE_ACCELEROMETER -> {
                         lastAccData = it.values.clone()
                         accEventCount++
-                        Log.d(
-                            TAG,
-                            "Accelerometer event: ${lastAccData!![0]},${lastAccData!![1]},${lastAccData!![2]}"
-                        )
+                        Log.d(TAG, "Accelerometer event: ${lastAccData!![0]},${lastAccData!![1]},${lastAccData!![2]}")
                     }
-
                     Sensor.TYPE_GYROSCOPE -> {
                         lastGyroData = it.values.clone()
                         gyroEventCount++
-                        Log.d(
-                            TAG,
-                            "Gyroscope event: ${lastGyroData!![0]},${lastGyroData!![1]},${lastGyroData!![2]}"
-                        )
+                        Log.d(TAG, "Gyroscope event: ${lastGyroData!![0]},${lastGyroData!![1]},${lastGyroData!![2]}")
                     }
-
                     Sensor.TYPE_MAGNETIC_FIELD -> {
                         lastMagData = it.values.clone()
                         magEventCount++
-                        Log.d(
-                            TAG,
-                            "Magnetometer event: ${lastMagData!![0]},${lastMagData!![1]},${lastMagData!![2]}"
-                        )
+                        Log.d(TAG, "Magnetometer event: ${lastMagData!![0]},${lastMagData!![1]},${lastMagData!![2]}")
                     }
-
                     else -> return
                 }
 
                 if (!hasShownImuWarning && isRecording && timestamp - sensorStartTime > IMU_TIMEOUT_MS &&
-                    accEventCount == 0 && gyroEventCount == 0 && magEventCount == 0
-                ) {
+                    accEventCount == 0 && gyroEventCount == 0 && magEventCount == 0) {
                     Log.e(TAG, "No IMU data received after ${IMU_TIMEOUT_MS}ms")
-                    Toast.makeText(this, "No IMU data detected. Check sensors.", Toast.LENGTH_LONG)
-                        .show()
+                    Toast.makeText(this, "No IMU data detected. Check sensors.", Toast.LENGTH_LONG).show()
                     hasShownImuWarning = true
                 }
 
-                if (timestamp - lastImuWriteTime >= IMU_WRITE_INTERVAL_MS) {
-                    val accX = lastAccData?.get(0) ?: 0f
-                    val accY = lastAccData?.get(1) ?: 0f
-                    val accZ = lastAccData?.get(2) ?: 0f
-                    val gyroX = lastGyroData?.get(0) ?: 0f
-                    val gyroY = lastGyroData?.get(1) ?: 0f
-                    val gyroZ = lastGyroData?.get(2) ?: 0f
+                if (timestamp - lastImuWriteTime >= IMU_WRITE_INTERVAL_MS && lastAccData != null && lastGyroData != null) {
+                    // Update orientation
+                    updateOrientation(timestamp)
+
+                    // Transform accelerometer to world frame
+                    val worldAcc = transformToWorldFrame(lastAccData!!)
+
+                    // Update position via IMU
+                    updatePosition(timestamp, worldAcc)
+
+                    // Write data
+                    val accX = lastAccData!![0]
+                    val accY = lastAccData!![1]
+                    val accZ = lastAccData!![2]
+                    val gyroX = lastGyroData!![0]
+                    val gyroY = lastGyroData!![1]
+                    val gyroZ = lastGyroData!![2]
                     val magX = lastMagData?.get(0) ?: 0f
                     val magY = lastMagData?.get(1) ?: 0f
                     val magZ = lastMagData?.get(2) ?: 0f
-                    val data = "$timestamp,$accX,$accY,$accZ,$gyroX,$gyroY,$gyroZ,$magX,$magY,$magZ"
+                    val data = "$timestamp,${position[0]},${position[1]},${position[2]},$accX,$accY,$accZ," +
+                            "${worldAcc[0]},${worldAcc[1]},${worldAcc[2]},$gyroX,$gyroY,$gyroZ,$magX,$magY,$magZ"
                     imuFileWriter?.write("$data\n")
                     imuFileWriter?.flush()
                     lastImuWriteTime = timestamp
                     Log.d(TAG, "IMU data written: $data")
-                } else {
-                    Log.d(TAG, "IMU data not written yet: $timestamp - $lastImuWriteTime")
+                }else{
+                    Log.d(TAG, "IMU data not written")
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error writing IMU data: ${e.message}", e)
             }
         }
+    }
+
+    private fun updateOrientation(timestamp: Long) {
+        if (lastImuTimestamp == 0L) {
+            lastImuTimestamp = timestamp
+            return
+        }
+
+        val dt = (timestamp - lastImuTimestamp) / 1000.0f // Seconds
+        lastImuTimestamp = timestamp
+
+        // Gyroscope integration
+        val gyroX = lastGyroData!![0]
+        val gyroY = lastGyroData!![1]
+        val gyroZ = lastGyroData!![2]
+        val gyroNorm = sqrt(gyroX * gyroX + gyroY * gyroY + gyroZ * gyroZ)
+        if (gyroNorm > 0.01) { // Avoid division by zero
+            val angle = gyroNorm * dt
+            val axisX = gyroX / gyroNorm
+            val axisY = gyroY / gyroNorm
+            val axisZ = gyroZ / gyroNorm
+            val s = sin(angle / 2)
+            val deltaQ = floatArrayOf(
+                cos(angle / 2),
+                axisX * s,
+                axisY * s,
+                axisZ * s
+            )
+            orientationQuaternion = quaternionMultiply(orientationQuaternion, deltaQ)
+            normalizeQuaternion(orientationQuaternion)
+        }
+
+        // Accelerometer and magnetometer correction
+        if (lastMagData != null && lastAccData != null) {
+            // Compute gravity direction from accelerometer
+            val accNorm = sqrt(lastAccData!![0] * lastAccData!![0] + lastAccData!![1] * lastAccData!![1] + lastAccData!![2] * lastAccData!![2])
+            if (accNorm > 0.1) {
+                val gravity = floatArrayOf(
+                    lastAccData!![0] / accNorm,
+                    lastAccData!![1] / accNorm,
+                    lastAccData!![2] / accNorm
+                )
+                // Compute magnetic north
+                val magNorm = sqrt(lastMagData!![0] * lastMagData!![0] + lastMagData!![1] * lastMagData!![1] + lastMagData!![2] * lastMagData!![2])
+                if (magNorm > 0.1) {
+                    val mag = floatArrayOf(
+                        lastMagData!![0] / magNorm,
+                        lastMagData!![1] / magNorm,
+                        lastMagData!![2] / magNorm
+                    )
+                    // Compute expected gravity and magnetic field in world frame
+                    val expectedGravity = floatArrayOf(0f, 0f, -1f)
+                    val expectedMag = floatArrayOf(0f, 1f, 0f) // Approximate magnetic north
+                    // Compute error quaternions
+                    val gravityError = crossProduct(rotateVector(orientationQuaternion, expectedGravity), gravity)
+                    val magError = crossProduct(rotateVector(orientationQuaternion, expectedMag), mag)
+                    val error = floatArrayOf(
+                        gravityError[0] + magError[0],
+                        gravityError[1] + magError[1],
+                        gravityError[2] + magError[2]
+                    )
+                    val errorNorm = sqrt(error[0] * error[0] + error[1] * error[1] + error[2] * error[2])
+                    if (errorNorm > 0.01) {
+                        val correctionQ = floatArrayOf(
+                            1f,
+                            error[0] / errorNorm * sin((1 - alpha) * errorNorm / 2),
+                            error[1] / errorNorm * sin((1 - alpha) * errorNorm / 2),
+                            error[2] / errorNorm * sin((1 - alpha) * errorNorm / 2)
+                        )
+                        orientationQuaternion = quaternionMultiply(orientationQuaternion, correctionQ)
+                        normalizeQuaternion(orientationQuaternion)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun transformToWorldFrame(acc: FloatArray): FloatArray {
+        // Remove gravity and rotate to world frame
+        val accNorm = sqrt(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2])
+        val gravityCorrected = if (accNorm > 0.1) {
+            floatArrayOf(
+                acc[0] - GRAVITY * lastAccData!![0] / accNorm,
+                acc[1] - GRAVITY * lastAccData!![1] / accNorm,
+                acc[2] - GRAVITY * lastAccData!![2] / accNorm
+            )
+        } else {
+            acc
+        }
+        return rotateVector(orientationQuaternion, gravityCorrected)
+    }
+
+    private fun updatePosition(timestamp: Long, worldAcc: FloatArray) {
+        if (lastImuTimestamp == 0L) return
+
+        val dt = (timestamp - lastImuTimestamp) / 1000.0 // Seconds
+        // Update velocity
+        velocity[0] += worldAcc[0] * dt
+        velocity[1] += worldAcc[1] * dt
+        velocity[2] += worldAcc[2] * dt
+        // Update position
+        position[0] += velocity[0] * dt + 0.5 * worldAcc[0] * dt * dt
+        position[1] += velocity[1] * dt + 0.5 * worldAcc[1] * dt * dt
+        position[2] += velocity[2] * dt + 0.5 * worldAcc[2] * dt * dt
+
+        lastWorldAcc = worldAcc
     }
 
     private fun saveGpsData(location: Location) {
@@ -508,14 +586,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             }
 
             if (!hasShownGpsWarning && isRecording && System.currentTimeMillis() - gpsStartTime > GPS_TIMEOUT_MS &&
-                gpsEventCount == 0
-            ) {
+                gpsEventCount == 0) {
                 Log.e(TAG, "No GPS data received after ${GPS_TIMEOUT_MS}ms")
-                Toast.makeText(
-                    this,
-                    "No GPS data detected. Check location services.",
-                    Toast.LENGTH_LONG
-                ).show()
+                Toast.makeText(this, "No GPS data detected. Check location services.", Toast.LENGTH_LONG).show()
                 hasShownGpsWarning = true
             }
 
@@ -525,43 +598,86 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             val bearing = if (location.hasBearing()) location.bearing else -1.0f
             val accuracy = if (location.hasAccuracy()) location.accuracy else -1.0f
 
-            // Set first GPS location as (0,0,0)
             if (firstGpsLocation == null) {
                 firstGpsLocation = location
-                Log.d(
-                    TAG,
-                    "First GPS fix: lat=${location.latitude}, lon=${location.longitude}, alt=${location.altitude}"
-                )
+                Log.d(TAG, "First GPS fix: lat=${location.latitude}, lon=${location.longitude}, alt=${location.altitude}")
             }
 
-            // Convert to local coordinates (flat Earth approximation)
             val (localX, localY, localZ) = latLonToLocalXYZ(location, firstGpsLocation!!)
-            val data =
-                "$timestamp,${location.latitude},${location.longitude},${location.altitude}," +
-                        "$speed,$bearing,$accuracy,$localX,$localY,$localZ"
+            // Fuse GPS with IMU position
+            position[0] = gpsAlpha * localX + (1 - gpsAlpha) * position[0]
+            position[1] = gpsAlpha * localY + (1 - gpsAlpha) * position[1]
+            position[2] = gpsAlpha * localZ + (1 - gpsAlpha) * position[2]
+            // Reset velocity to reduce drift
+            velocity[0] *= (1 - gpsAlpha)
+            velocity[1] *= (1 - gpsAlpha)
+            velocity[2] *= (1 - gpsAlpha)
+
+            val data = "$timestamp,${location.latitude},${location.longitude},${location.altitude}," +
+                    "$speed,$bearing,$accuracy,$localX,$localY,$localZ"
             gpsFileWriter?.write("$data\n")
             gpsFileWriter?.flush()
             Log.d(TAG, "GPS data written: $data")
+
+            lastGpsLocation = location
+            lastGpsTimestamp = timestamp
+            lastGpsLocalX = localX
+            lastGpsLocalY = localY
+            lastGpsLocalZ = localZ
         } catch (e: Exception) {
             Log.e(TAG, "Error writing GPS data: ${e.message}", e)
         }
     }
 
-    private fun latLonToLocalXYZ(
-        location: Location,
-        reference: Location
-    ): Triple<Double, Double, Double> {
+    private fun latLonToLocalXYZ(location: Location, reference: Location): Triple<Double, Double, Double> {
         val latRad = Math.toRadians(location.latitude)
         val refLatRad = Math.toRadians(reference.latitude)
         val lonRad = Math.toRadians(location.longitude)
         val refLonRad = Math.toRadians(reference.longitude)
 
-        // Flat Earth approximation
         val x = EARTH_RADIUS_M * (lonRad - refLonRad) * cos(refLatRad) // East-West
         val y = EARTH_RADIUS_M * (latRad - refLatRad) // North-South
         val z = location.altitude - reference.altitude // Up-Down
 
         return Triple(x, y, z)
+    }
+
+    // Quaternion utilities
+    private fun quaternionMultiply(q1: FloatArray, q2: FloatArray): FloatArray {
+        val w1 = q1[0]; val x1 = q1[1]; val y1 = q1[2]; val z1 = q1[3]
+        val w2 = q2[0]; val x2 = q2[1]; val y2 = q2[2]; val z2 = q2[3]
+        return floatArrayOf(
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+        )
+    }
+
+    private fun normalizeQuaternion(q: FloatArray) {
+        val norm = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
+        if (norm > 0) {
+            q[0] /= norm
+            q[1] /= norm
+            q[2] /= norm
+            q[3] /= norm
+        }
+    }
+
+    private fun rotateVector(q: FloatArray, v: FloatArray): FloatArray {
+        val qConj = floatArrayOf(q[0], -q[1], -q[2], -q[3])
+        val vQuat = floatArrayOf(0f, v[0], v[1], v[2])
+        val temp = quaternionMultiply(q, vQuat)
+        val result = quaternionMultiply(temp, qConj)
+        return floatArrayOf(result[1], result[2], result[3])
+    }
+
+    private fun crossProduct(a: FloatArray, b: FloatArray): FloatArray {
+        return floatArrayOf(
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0]
+        )
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
