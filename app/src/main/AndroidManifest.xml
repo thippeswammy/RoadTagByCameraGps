@@ -6,25 +6,14 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
-    <!-- Storage permission for Android 9 and below -->
+    <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" /> <!-- Storage permission for Android 9 and below -->
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
 
     <uses-feature
         android:name="android.hardware.camera"
-        android:required="true" />
-    <uses-feature
-        android:name="android.hardware.location.gps"
-        android:required="true" />
-    <uses-feature
-        android:name="android.hardware.sensor.accelerometer"
-        android:required="true" />
-    <uses-feature
-        android:name="android.hardware.sensor.gyroscope"
-        android:required="true" />
-    <!-- Features required by the app -->
+        android:required="true" /> <!-- Features required by the app -->
     <uses-feature
         android:name="android.hardware.camera"
         android:required="true" />
@@ -32,7 +21,16 @@
         android:name="android.hardware.location.gps"
         android:required="true" />
     <uses-feature
+        android:name="android.hardware.location.gps"
+        android:required="true" />
+    <uses-feature
         android:name="android.hardware.sensor.accelerometer"
+        android:required="true" />
+    <uses-feature
+        android:name="android.hardware.sensor.accelerometer"
+        android:required="true" />
+    <uses-feature
+        android:name="android.hardware.sensor.gyroscope"
         android:required="true" />
     <uses-feature
         android:name="android.hardware.sensor.gyroscope"
@@ -49,10 +47,14 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.SensorApp">
         <activity
+            android:name=".TrajectoryActivity"
+            android:exported="false" />
+        <activity
             android:name=".MainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
+
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
